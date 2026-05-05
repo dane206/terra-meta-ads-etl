@@ -31,12 +31,13 @@ Config (config.ini):
 """
 
 import os, sys, argparse, traceback, time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 import configparser
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.adsinsights import AdsInsights
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
 config = configparser.ConfigParser()
@@ -55,6 +56,7 @@ BQ_PROJECT   = os.environ.get("BQ_PROJECT") or config.get("bigquery", "project",
 BQ_DATASET   = config.get("bigquery", "dataset", fallback="sources")
 
 EARLIEST_DATE = "2024-04-01"
+INSIGHTS_CHUNK_DAYS = int(os.environ.get("META_INSIGHTS_CHUNK_DAYS", "28"))
 
 # ── Fields ────────────────────────────────────────────────────────────────────
 CAMPAIGN_FIELDS = [
@@ -222,11 +224,78 @@ def parse_base(row, loaded_at):
         "_loaded_at":      loaded_at,
     }
 
-def load_to_bq(table, rows, schema, mode):
+def schema_columns(schema):
+    return ", ".join(f"`{field.name}`" for field in schema)
+
+def append_with_date_replace(table_id, table, rows, schema, start_date, end_date):
+    bq.get_table(table_id)
+
+    temp_table_id = f"{BQ_PROJECT}.{BQ_DATASET}._tmp_{table}_{int(time.time() * 1000)}"
+    try:
+        load_job = bq.load_table_from_json(rows, temp_table_id, job_config=bigquery.LoadJobConfig(
+            schema=schema,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            ignore_unknown_values=True,
+        ))
+        load_job.result()
+
+        columns = schema_columns(schema)
+        replace_sql = f"""
+        BEGIN TRANSACTION;
+
+        DELETE FROM `{table_id}`
+        WHERE date BETWEEN @start_date AND @end_date;
+
+        INSERT INTO `{table_id}` ({columns})
+        SELECT {columns}
+        FROM `{temp_table_id}`;
+
+        COMMIT TRANSACTION;
+        """
+        replace_job = bq.query(
+            replace_sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+            ]),
+        )
+        replace_job.result()
+    finally:
+        bq.delete_table(temp_table_id, not_found_ok=True)
+
+def delete_date_range(table_id, start_date, end_date):
+    bq.get_table(table_id)
+    delete_job = bq.query(
+        f"DELETE FROM `{table_id}` WHERE date BETWEEN @start_date AND @end_date",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+            bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+        ]),
+    )
+    delete_job.result()
+
+def load_to_bq(table, rows, schema, mode, start_date=None, end_date=None):
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{table}"
+
     if not rows:
+        if mode == bigquery.WriteDisposition.WRITE_APPEND and start_date and end_date:
+            try:
+                delete_date_range(table_id, start_date, end_date)
+                print(f"  ✅ {table_id} — cleared {start_date} → {end_date}; no fresh rows")
+                return
+            except NotFound:
+                pass
         print(f"  ⚠️  {table} — no rows")
         return
-    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{table}"
+
+    if mode == bigquery.WriteDisposition.WRITE_APPEND and start_date and end_date:
+        try:
+            append_with_date_replace(table_id, table, rows, schema, start_date, end_date)
+            print(f"  ✅ {table_id} — replaced {start_date} → {end_date}; {bq.get_table(table_id).num_rows:,} rows")
+            return
+        except NotFound:
+            pass
+
     job = bq.load_table_from_json(rows, table_id, job_config=bigquery.LoadJobConfig(
         schema=schema,
         write_disposition=mode,
@@ -247,9 +316,18 @@ def get_max_date(table):
     except Exception:
         return None
 
+def date_windows(start_date, end_date, chunk_days):
+    """Yield inclusive date windows no larger than chunk_days."""
+    current = datetime.strptime(start_date, "%Y-%m-%d").date()
+    final = datetime.strptime(end_date, "%Y-%m-%d").date()
+    while current <= final:
+        window_end = min(current + timedelta(days=chunk_days - 1), final)
+        yield str(current), str(window_end)
+        current = window_end + timedelta(days=1)
+
 # ── Insights fetcher ──────────────────────────────────────────────────────────
-def fetch_insights(account_id, fields, level, start_date, end_date):
-    """Fetch insights for a given account, level, and date range."""
+def fetch_insights_window(account_id, fields, level, start_date, end_date):
+    """Fetch insights for one already-sized date window."""
     account = AdAccount(account_id)
     params = {
         "level":           level,
@@ -271,9 +349,35 @@ def fetch_insights(account_id, fields, level, start_date, end_date):
             break
     return rows
 
+def fetch_insights(account_id, fields, level, start_date, end_date):
+    """Fetch insights for a given account and level in API-friendly date chunks."""
+    rows = []
+    windows = list(date_windows(start_date, end_date, INSIGHTS_CHUNK_DAYS))
+    for window_start, window_end in windows:
+        if len(windows) > 1:
+            print(f"\n      {level} window {window_start} → {window_end}...", end="", flush=True)
+        try:
+            window_rows = fetch_insights_window(account_id, fields, level, window_start, window_end)
+        except Exception:
+            start = datetime.strptime(window_start, "%Y-%m-%d").date()
+            end = datetime.strptime(window_end, "%Y-%m-%d").date()
+            if start == end:
+                raise
+
+            midpoint = start + ((end - start) // 2)
+            left_rows = fetch_insights(account_id, fields, level, str(start), str(midpoint))
+            right_rows = fetch_insights(account_id, fields, level, str(midpoint + timedelta(days=1)), str(end))
+            window_rows = left_rows + right_rows
+
+        rows.extend(window_rows)
+        if len(windows) > 1:
+            print(f" {len(window_rows):,}", end="", flush=True)
+    return rows
+
 # ── Main runner ───────────────────────────────────────────────────────────────
 def run(start_date, end_date, write_mode, loaded_at):
     all_campaigns, all_adsets, all_ads = [], [], []
+    fetch_errors = []
     _start = time.time()
 
     for account_id in ACCOUNT_IDS:
@@ -328,6 +432,7 @@ def run(start_date, end_date, write_mode, loaded_at):
                 all_ads.append(r)
 
         except Exception as e:
+            fetch_errors.append(account_id)
             print(f"  ❌ {account_id} — {e}")
             continue
 
@@ -336,10 +441,14 @@ def run(start_date, end_date, write_mode, loaded_at):
     print(f"\n  campaigns: {len(all_campaigns):,} | adsets: {len(all_adsets):,} | ads: {len(all_ads):,}")
     elapsed = int(time.time() - _start)
     print(f"  Elapsed: {elapsed//60}m {elapsed%60}s")
+    if fetch_errors:
+        failed_accounts = ", ".join(fetch_errors)
+        raise RuntimeError(f"Fetch failed for {failed_accounts}; BigQuery load skipped to avoid partial data")
+
     print("\n💾 Loading to BigQuery...")
-    load_to_bq("meta_ads_campaigns_daily", all_campaigns, CAMPAIGNS_SCHEMA, write_mode)
-    load_to_bq("meta_ads_adsets_daily",    all_adsets,    ADSETS_SCHEMA,    write_mode)
-    load_to_bq("meta_ads_ads_daily",       all_ads,       ADS_SCHEMA,       write_mode)
+    load_to_bq("meta_ads_campaigns_daily", all_campaigns, CAMPAIGNS_SCHEMA, write_mode, start_date, end_date)
+    load_to_bq("meta_ads_adsets_daily",    all_adsets,    ADSETS_SCHEMA,    write_mode, start_date, end_date)
+    load_to_bq("meta_ads_ads_daily",       all_ads,       ADS_SCHEMA,       write_mode, start_date, end_date)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -359,7 +468,7 @@ def main():
     if args.mode == "incremental":
         max_date   = get_max_date("meta_ads_campaigns_daily")
         start_date = str((datetime.strptime(max_date, "%Y-%m-%d").date() - timedelta(days=2))) if max_date else str(date.today() - timedelta(days=7))
-        loaded_at  = datetime.utcnow().isoformat()
+        loaded_at  = datetime.now(timezone.utc).isoformat()
         write_mode = bigquery.WriteDisposition.WRITE_APPEND
         print(f"\U0001f680 Meta Ads incremental: {start_date} \u2192 {yesterday}")
         print(f"   Accounts: {', '.join(a.strip() for a in ACCOUNT_IDS)}")
@@ -380,7 +489,7 @@ def main():
                 chunk_end = date(chunk_start.year, chunk_start.month + 1, 1) - timedelta(days=1)
             chunk_end = min(chunk_end, yesterday)
             write_mode = bigquery.WriteDisposition.WRITE_TRUNCATE if first else bigquery.WriteDisposition.WRITE_APPEND
-            loaded_at  = datetime.utcnow().isoformat()
+            loaded_at  = datetime.now(timezone.utc).isoformat()
             print(f"\n\U0001f4c5 Chunk: {chunk_start} \u2192 {chunk_end}")
             run(str(chunk_start), str(chunk_end), write_mode, loaded_at)
             chunk_start = chunk_end + timedelta(days=1)
