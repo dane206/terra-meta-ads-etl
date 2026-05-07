@@ -45,7 +45,7 @@ gcloud run jobs deploy "$JOB" \
   --task-timeout 3600 \
   --memory 512Mi \
   --cpu 1 \
-  --set-env-vars "BQ_PROJECT=${PROJECT},META_ACCOUNT_IDS=act_994866890890084\,act_2219077071728671\,act_461423467875645" \
+  --set-env-vars "^:^BQ_PROJECT=${PROJECT}:META_ACCOUNT_IDS=act_994866890890084,act_2219077071728671,act_461423467875645" \
   --set-secrets "META_ACCESS_TOKEN=meta-access-token:latest,META_APP_ID=meta-app-id:latest,META_APP_SECRET=meta-app-secret:latest" \
   --quiet
 
