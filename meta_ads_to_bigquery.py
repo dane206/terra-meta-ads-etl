@@ -526,7 +526,6 @@ def main():
         print(f"\U0001f680 Meta Ads backfill: {chunk_start} \u2192 {end_date} (monthly chunks)")
         print(f"   Accounts: {', '.join(account_label(a) for a in ACCOUNT_IDS)}")
         print(f"   Project:  {BQ_PROJECT}.{BQ_DATASET}")
-        first = True
         while chunk_start <= end_date:
             # End of month
             if chunk_start.month == 12:
@@ -534,12 +533,11 @@ def main():
             else:
                 chunk_end = date(chunk_start.year, chunk_start.month + 1, 1) - timedelta(days=1)
             chunk_end = min(chunk_end, end_date)
-            write_mode = bigquery.WriteDisposition.WRITE_TRUNCATE if first else bigquery.WriteDisposition.WRITE_APPEND
+            write_mode = bigquery.WriteDisposition.WRITE_APPEND
             loaded_at  = datetime.now(timezone.utc).isoformat()
             print(f"\n\U0001f4c5 Chunk: {chunk_start} \u2192 {chunk_end}")
             run(str(chunk_start), str(chunk_end), write_mode, loaded_at)
             chunk_start = chunk_end + timedelta(days=1)
-            first = False
 
     print("\n\u2705 Done")
 
