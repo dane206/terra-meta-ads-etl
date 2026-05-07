@@ -42,6 +42,8 @@ gcloud run jobs deploy "$JOB" \
   --image "$IMAGE" \
   --region "$REGION" \
   --project "$PROJECT" \
+  --command python3 \
+  --args meta_ads_to_bigquery.py,--mode,incremental \
   --task-timeout 3600 \
   --memory 512Mi \
   --cpu 1 \
