@@ -7,7 +7,6 @@ Pulls daily Meta Ads performance data across all Terra ad accounts → `terra-an
 | ID | Name |
 |---|---|
 | act_994866890890084 | Terra 003 |
-| act_466216000727046 | Terra 001 |
 | act_2219077071728671 | Terra 005 |
 | act_461423467875645 | Terra 002 |
 
@@ -40,7 +39,7 @@ Add credentials to `config.ini`:
 access_token = YOUR_LONG_LIVED_ACCESS_TOKEN
 app_id       = YOUR_APP_ID
 app_secret   = YOUR_APP_SECRET
-account_ids  = act_994866890890084,act_466216000727046,act_2219077071728671,act_461423467875645
+account_ids  = act_994866890890084,act_2219077071728671,act_461423467875645
 
 [bigquery]
 project = terra-analytics-dev

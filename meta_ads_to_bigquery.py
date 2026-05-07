@@ -7,7 +7,6 @@ across all Terra Meta ad accounts.
 
 Ad accounts:
   act_994866890890084  Terra 003
-  act_466216000727046  Terra 001
   act_2219077071728671 Terra 005
   act_461423467875645  Terra 002
 
@@ -27,7 +26,7 @@ Config (config.ini):
   access_token    = YOUR_LONG_LIVED_ACCESS_TOKEN
   app_id          = YOUR_APP_ID
   app_secret      = YOUR_APP_SECRET
-  account_ids     = act_994866890890084,act_466216000727046,act_2219077071728671,act_461423467875645
+  account_ids     = act_994866890890084,act_2219077071728671,act_461423467875645
 """
 
 import os, sys, argparse, traceback, time
@@ -50,7 +49,13 @@ APP_SECRET   = os.environ.get("META_APP_SECRET")   or config.get("meta_ads", "ap
 ACCOUNT_IDS  = (
     os.environ.get("META_ACCOUNT_IDS") or
     config.get("meta_ads", "account_ids", fallback="")
-).split(",")
+)
+ACCOUNT_IDS = [account_id.strip() for account_id in ACCOUNT_IDS.split(",") if account_id.strip()]
+ACCOUNT_NAMES = {
+    "act_994866890890084": "Terra 003",
+    "act_2219077071728671": "Terra 005",
+    "act_461423467875645": "Terra 002",
+}
 
 BQ_PROJECT   = os.environ.get("BQ_PROJECT") or config.get("bigquery", "project", fallback="terra-analytics-dev")
 BQ_DATASET   = config.get("bigquery", "dataset", fallback="sources")
@@ -325,6 +330,9 @@ def date_windows(start_date, end_date, chunk_days):
         yield str(current), str(window_end)
         current = window_end + timedelta(days=1)
 
+def account_label(account_id):
+    return f"{ACCOUNT_NAMES.get(account_id, 'Unknown')} ({account_id})"
+
 # ── Insights fetcher ──────────────────────────────────────────────────────────
 def fetch_insights_window(account_id, fields, level, start_date, end_date):
     """Fetch insights for one already-sized date window."""
@@ -349,13 +357,32 @@ def fetch_insights_window(account_id, fields, level, start_date, end_date):
             break
     return rows
 
-def fetch_insights(account_id, fields, level, start_date, end_date):
+def fetch_insights(
+    account_id,
+    fields,
+    level,
+    start_date,
+    end_date,
+    progress_offset=0,
+    total_progress=None,
+    account_progress=None,
+    level_progress=None,
+):
     """Fetch insights for a given account and level in API-friendly date chunks."""
     rows = []
     windows = list(date_windows(start_date, end_date, INSIGHTS_CHUNK_DAYS))
-    for window_start, window_end in windows:
-        if len(windows) > 1:
-            print(f"\n      {level} window {window_start} → {window_end}...", end="", flush=True)
+    for window_index, (window_start, window_end) in enumerate(windows, start=1):
+        progress_number = progress_offset + window_index
+        progress_parts = []
+        if total_progress:
+            progress_parts.append(f"progress {progress_number}/{total_progress}")
+        if account_progress:
+            progress_parts.append(f"account {account_progress[0]}/{account_progress[1]}")
+        if level_progress:
+            progress_parts.append(f"level {level_progress[0]}/{level_progress[1]}")
+        progress_parts.append(f"window {window_index}/{len(windows)}")
+        progress_label = ", ".join(progress_parts)
+        print(f"\n      [{progress_label}] {level} {window_start} → {window_end}...", end="", flush=True)
         try:
             window_rows = fetch_insights_window(account_id, fields, level, window_start, window_end)
         except Exception:
@@ -370,8 +397,7 @@ def fetch_insights(account_id, fields, level, start_date, end_date):
             window_rows = left_rows + right_rows
 
         rows.extend(window_rows)
-        if len(windows) > 1:
-            print(f" {len(window_rows):,}", end="", flush=True)
+        print(f" {len(window_rows):,}", end="", flush=True)
     return rows
 
 # ── Main runner ───────────────────────────────────────────────────────────────
@@ -379,57 +405,68 @@ def run(start_date, end_date, write_mode, loaded_at):
     all_campaigns, all_adsets, all_ads = [], [], []
     fetch_errors = []
     _start = time.time()
+    accounts = [account_id.strip() for account_id in ACCOUNT_IDS if account_id.strip()]
+    levels = [
+        ("campaigns", CAMPAIGN_FIELDS, "campaign", "campaign-days"),
+        ("ad sets", ADSET_FIELDS, "adset", "adset-days"),
+        ("ads", AD_FIELDS, "ad", "ad-days"),
+    ]
+    window_count = len(list(date_windows(start_date, end_date, INSIGHTS_CHUNK_DAYS)))
+    total_fetch_units = len(accounts) * len(levels) * window_count
 
-    for account_id in ACCOUNT_IDS:
-        account_id = account_id.strip()
-        if not account_id:
-            continue
-        print(f"\n  Account: {account_id}")
+    print(f"  Fetch plan: {len(accounts)} accounts × {len(levels)} levels × {window_count} windows = {total_fetch_units} fetch units")
+
+    for account_index, account_id in enumerate(accounts, start=1):
+        print(f"\n  Account {account_index}/{len(accounts)}: {account_label(account_id)}")
 
         try:
-            # Campaigns
-            print("    Fetching campaigns...", end="", flush=True)
-            rows = fetch_insights(account_id, CAMPAIGN_FIELDS, "campaign", start_date, end_date)
-            print(f" {len(rows):,} campaign-days")
-            for row in rows:
-                r = parse_base(row, loaded_at)
-                r.update({
-                    "campaign_id":   row.get("campaign_id"),
-                    "campaign_name": row.get("campaign_name"),
-                    "objective":     row.get("objective"),
-                })
-                all_campaigns.append(r)
+            for level_index, (label, fields, level, day_label) in enumerate(levels, start=1):
+                print(f"    Fetching {label}...", end="", flush=True)
+                progress_offset = (
+                    ((account_index - 1) * len(levels) + (level_index - 1))
+                    * window_count
+                )
+                rows = fetch_insights(
+                    account_id,
+                    fields,
+                    level,
+                    start_date,
+                    end_date,
+                    progress_offset=progress_offset,
+                    total_progress=total_fetch_units,
+                    account_progress=(account_index, len(accounts)),
+                    level_progress=(level_index, len(levels)),
+                )
+                print(f" {len(rows):,} {day_label}")
 
-            # Ad sets
-            print("    Fetching ad sets...", end="", flush=True)
-            rows = fetch_insights(account_id, ADSET_FIELDS, "adset", start_date, end_date)
-            print(f" {len(rows):,} adset-days")
-            for row in rows:
-                r = parse_base(row, loaded_at)
-                r.update({
-                    "campaign_id":       row.get("campaign_id"),
-                    "campaign_name":     row.get("campaign_name"),
-                    "adset_id":          row.get("adset_id"),
-                    "adset_name":        row.get("adset_name"),
-                    "optimization_goal": row.get("optimization_goal"),
-                })
-                all_adsets.append(r)
-
-            # Ads
-            print("    Fetching ads...", end="", flush=True)
-            rows = fetch_insights(account_id, AD_FIELDS, "ad", start_date, end_date)
-            print(f" {len(rows):,} ad-days")
-            for row in rows:
-                r = parse_base(row, loaded_at)
-                r.update({
-                    "campaign_id":   row.get("campaign_id"),
-                    "campaign_name": row.get("campaign_name"),
-                    "adset_id":      row.get("adset_id"),
-                    "adset_name":    row.get("adset_name"),
-                    "ad_id":         row.get("ad_id"),
-                    "ad_name":       row.get("ad_name"),
-                })
-                all_ads.append(r)
+                for row in rows:
+                    r = parse_base(row, loaded_at)
+                    if level == "campaign":
+                        r.update({
+                            "campaign_id":   row.get("campaign_id"),
+                            "campaign_name": row.get("campaign_name"),
+                            "objective":     row.get("objective"),
+                        })
+                        all_campaigns.append(r)
+                    elif level == "adset":
+                        r.update({
+                            "campaign_id":       row.get("campaign_id"),
+                            "campaign_name":     row.get("campaign_name"),
+                            "adset_id":          row.get("adset_id"),
+                            "adset_name":        row.get("adset_name"),
+                            "optimization_goal": row.get("optimization_goal"),
+                        })
+                        all_adsets.append(r)
+                    else:
+                        r.update({
+                            "campaign_id":   row.get("campaign_id"),
+                            "campaign_name": row.get("campaign_name"),
+                            "adset_id":      row.get("adset_id"),
+                            "adset_name":    row.get("adset_name"),
+                            "ad_id":         row.get("ad_id"),
+                            "ad_name":       row.get("ad_name"),
+                        })
+                        all_ads.append(r)
 
         except Exception as e:
             fetch_errors.append(account_id)
@@ -455,39 +492,48 @@ def main():
     if not ACCESS_TOKEN:
         print("\u274c access_token not set in config.ini [meta_ads] or META_ACCESS_TOKEN env var")
         sys.exit(1)
+    if not ACCOUNT_IDS:
+        print("\u274c account_ids not set in config.ini [meta_ads] or META_ACCOUNT_IDS env var")
+        sys.exit(1)
 
     FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["backfill", "incremental"], default="incremental")
     parser.add_argument("--start", default=EARLIEST_DATE, help="Backfill start date (YYYY-MM-DD)")
+    parser.add_argument("--end", help="Optional end date (YYYY-MM-DD); defaults to yesterday")
     args = parser.parse_args()
 
     yesterday = date.today() - timedelta(days=1)
+    end_date = datetime.strptime(args.end, "%Y-%m-%d").date() if args.end else yesterday
+    end_date = min(end_date, yesterday)
 
     if args.mode == "incremental":
         max_date   = get_max_date("meta_ads_campaigns_daily")
         start_date = str((datetime.strptime(max_date, "%Y-%m-%d").date() - timedelta(days=2))) if max_date else str(date.today() - timedelta(days=7))
+        if datetime.strptime(start_date, "%Y-%m-%d").date() > end_date:
+            print(f"\u2705 Meta Ads incremental already current through {end_date}")
+            return
         loaded_at  = datetime.now(timezone.utc).isoformat()
         write_mode = bigquery.WriteDisposition.WRITE_APPEND
-        print(f"\U0001f680 Meta Ads incremental: {start_date} \u2192 {yesterday}")
-        print(f"   Accounts: {', '.join(a.strip() for a in ACCOUNT_IDS)}")
+        print(f"\U0001f680 Meta Ads incremental: {start_date} \u2192 {end_date}")
+        print(f"   Accounts: {', '.join(account_label(a) for a in ACCOUNT_IDS)}")
         print(f"   Project:  {BQ_PROJECT}.{BQ_DATASET}")
-        run(start_date, str(yesterday), write_mode, loaded_at)
+        run(start_date, str(end_date), write_mode, loaded_at)
     else:
         # Backfill in monthly chunks to avoid Meta API 500s
         chunk_start = datetime.strptime(args.start, "%Y-%m-%d").date()
-        print(f"\U0001f680 Meta Ads backfill: {chunk_start} \u2192 {yesterday} (monthly chunks)")
-        print(f"   Accounts: {', '.join(a.strip() for a in ACCOUNT_IDS)}")
+        print(f"\U0001f680 Meta Ads backfill: {chunk_start} \u2192 {end_date} (monthly chunks)")
+        print(f"   Accounts: {', '.join(account_label(a) for a in ACCOUNT_IDS)}")
         print(f"   Project:  {BQ_PROJECT}.{BQ_DATASET}")
         first = True
-        while chunk_start <= yesterday:
+        while chunk_start <= end_date:
             # End of month
             if chunk_start.month == 12:
                 chunk_end = date(chunk_start.year + 1, 1, 1) - timedelta(days=1)
             else:
                 chunk_end = date(chunk_start.year, chunk_start.month + 1, 1) - timedelta(days=1)
-            chunk_end = min(chunk_end, yesterday)
+            chunk_end = min(chunk_end, end_date)
             write_mode = bigquery.WriteDisposition.WRITE_TRUNCATE if first else bigquery.WriteDisposition.WRITE_APPEND
             loaded_at  = datetime.now(timezone.utc).isoformat()
             print(f"\n\U0001f4c5 Chunk: {chunk_start} \u2192 {chunk_end}")
