@@ -52,13 +52,16 @@ To generate a long-lived access token: Facebook Developer Console → Your App �
 
 ```bash
 # Incremental — last 7 days, APPEND
-python meta_ads_to_bigquery.py --mode incremental
+python3 meta_ads_to_bigquery.py --mode incremental
 
 # Backfill — 2024-04-01 → yesterday, TRUNCATE
-python meta_ads_to_bigquery.py --mode backfill
+python3 meta_ads_to_bigquery.py --mode backfill
 
 # Backfill from specific date
-python meta_ads_to_bigquery.py --mode backfill --start 2024-10-01
+python3 meta_ads_to_bigquery.py --mode backfill --start 2024-10-01
+
+# Catch up one missing calendar month after current MAX(date)
+python3 meta_ads_to_bigquery.py --mode catchup
 ```
 
 ## Auth

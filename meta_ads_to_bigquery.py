@@ -333,6 +333,33 @@ def date_windows(start_date, end_date, chunk_days):
 def account_label(account_id):
     return f"{ACCOUNT_NAMES.get(account_id, 'Unknown')} ({account_id})"
 
+def month_end(value):
+    if value.month == 12:
+        return date(value.year + 1, 1, 1) - timedelta(days=1)
+    return date(value.year, value.month + 1, 1) - timedelta(days=1)
+
+def next_month_start(value):
+    return month_end(value) + timedelta(days=1)
+
+def get_coverage_max_date():
+    table_max_dates = []
+    for table in ("meta_ads_campaigns_daily", "meta_ads_adsets_daily", "meta_ads_ads_daily"):
+        max_date = get_max_date(table)
+        if not max_date:
+            return None
+        table_max_dates.append(datetime.strptime(max_date, "%Y-%m-%d").date())
+    return min(table_max_dates)
+
+def catchup_window(end_date):
+    max_date = get_coverage_max_date()
+    if max_date:
+        start = next_month_start(max_date)
+    else:
+        start = datetime.strptime(EARLIEST_DATE, "%Y-%m-%d").date()
+    if start > end_date:
+        return None, None
+    return start, min(month_end(start), end_date)
+
 # ── Insights fetcher ──────────────────────────────────────────────────────────
 def fetch_insights_window(account_id, fields, level, start_date, end_date):
     """Fetch insights for one already-sized date window."""
@@ -499,7 +526,7 @@ def main():
     FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["backfill", "incremental"], default="incremental")
+    parser.add_argument("--mode", choices=["backfill", "catchup", "incremental"], default="incremental")
     parser.add_argument("--start", default=EARLIEST_DATE, help="Backfill start date (YYYY-MM-DD)")
     parser.add_argument("--end", help="Optional end date (YYYY-MM-DD); defaults to yesterday")
     args = parser.parse_args()
@@ -520,6 +547,17 @@ def main():
         print(f"   Accounts: {', '.join(account_label(a) for a in ACCOUNT_IDS)}")
         print(f"   Project:  {BQ_PROJECT}.{BQ_DATASET}")
         run(start_date, str(end_date), write_mode, loaded_at)
+    elif args.mode == "catchup":
+        start_date, catchup_end = catchup_window(end_date)
+        if not start_date:
+            print(f"✅ Meta Ads catchup already current through {end_date}")
+            return
+        loaded_at = datetime.now(timezone.utc).isoformat()
+        write_mode = bigquery.WriteDisposition.WRITE_APPEND
+        print(f"🚀 Meta Ads catchup: {start_date} → {catchup_end}")
+        print(f"   Accounts: {', '.join(account_label(a) for a in ACCOUNT_IDS)}")
+        print(f"   Project:  {BQ_PROJECT}.{BQ_DATASET}")
+        run(str(start_date), str(catchup_end), write_mode, loaded_at)
     else:
         # Backfill in monthly chunks to avoid Meta API 500s
         chunk_start = datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -527,12 +565,7 @@ def main():
         print(f"   Accounts: {', '.join(account_label(a) for a in ACCOUNT_IDS)}")
         print(f"   Project:  {BQ_PROJECT}.{BQ_DATASET}")
         while chunk_start <= end_date:
-            # End of month
-            if chunk_start.month == 12:
-                chunk_end = date(chunk_start.year + 1, 1, 1) - timedelta(days=1)
-            else:
-                chunk_end = date(chunk_start.year, chunk_start.month + 1, 1) - timedelta(days=1)
-            chunk_end = min(chunk_end, end_date)
+            chunk_end = min(month_end(chunk_start), end_date)
             write_mode = bigquery.WriteDisposition.WRITE_APPEND
             loaded_at  = datetime.now(timezone.utc).isoformat()
             print(f"\n\U0001f4c5 Chunk: {chunk_start} \u2192 {chunk_end}")
