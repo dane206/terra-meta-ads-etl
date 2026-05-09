@@ -44,7 +44,7 @@ gcloud run jobs deploy "$JOB" \
   --project "$PROJECT" \
   --command python3 \
   --args meta_ads_to_bigquery.py,--mode,incremental \
-  --task-timeout 3600 \
+  --task-timeout 7200 \
   --memory 512Mi \
   --cpu 1 \
   --set-env-vars "^:^BQ_PROJECT=${PROJECT}:BQ_DATASET=sources:META_INSIGHTS_CHUNK_DAYS=7:META_ACCOUNT_IDS=act_994866890890084,act_2219077071728671,act_461423467875645" \
@@ -53,6 +53,34 @@ gcloud run jobs deploy "$JOB" \
 
 echo ""
 echo "✅ Deployed $JOB to Cloud Run ($ENV)"
+
+# ── Cloud Scheduler ───────────────────────────────────────────────────────────
+SCHEDULER_JOB="${SERVICE}-daily"
+SA=$(gcloud run jobs describe "$JOB" --region "$REGION" --project "$PROJECT" --format="value(spec.template.spec.template.spec.serviceAccountName)")
+JOB_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${JOB}:run"
+
+echo "⏰ Configuring Cloud Scheduler ($SCHEDULER_JOB)..."
+gcloud scheduler jobs create http "$SCHEDULER_JOB" \
+  --schedule "3 6 * * *" \
+  --time-zone "America/Los_Angeles" \
+  --uri "$JOB_URI" \
+  --message-body "{}" \
+  --oauth-service-account-email "$SA" \
+  --location "$REGION" \
+  --project "$PROJECT" \
+  --quiet 2>/dev/null \
+|| gcloud scheduler jobs update http "$SCHEDULER_JOB" \
+  --schedule "3 6 * * *" \
+  --time-zone "America/Los_Angeles" \
+  --uri "$JOB_URI" \
+  --message-body "{}" \
+  --oauth-service-account-email "$SA" \
+  --location "$REGION" \
+  --project "$PROJECT" \
+  --quiet
+
+echo ""
+echo "✅ Scheduler: $SCHEDULER_JOB fires daily at 06:03 local"
 echo ""
 echo "To run now:"
 echo "  gcloud run jobs execute $JOB --region $REGION --project $PROJECT"
