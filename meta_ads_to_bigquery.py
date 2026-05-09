@@ -459,7 +459,12 @@ def verify_mode(start_date, end_date):
         api_spend = round(api["spend"], 2)
         bq_spend  = round(bq_["spend"], 2)
         delta     = round(bq_spend - api_spend, 2)
-        pct       = round((delta / api_spend * 100), 1) if api_spend else 0.0
+        if api_spend:
+            pct = round((delta / api_spend * 100), 1)
+        elif bq_spend:
+            pct = 100.0
+        else:
+            pct = 0.0
         flag      = " ⚠️" if abs(pct) > 1 else ""
         if flag:
             has_issue = True
@@ -480,7 +485,12 @@ def verify_mode(start_date, end_date):
         a = monthly_api.get(month, {"spend": 0.0, "purchase_value": 0.0})
         b = monthly_bq.get(month, {"spend": 0.0, "purchase_value": 0.0})
         delta = round(b["spend"] - a["spend"], 2)
-        pct   = round((delta / a["spend"] * 100), 1) if a["spend"] else 0.0
+        if a["spend"]:
+            pct = round((delta / a["spend"] * 100), 1)
+        elif b["spend"]:
+            pct = 100.0
+        else:
+            pct = 0.0
         flag  = " ⚠️" if abs(pct) > 1 else ""
         print(f"  {month:<8} {round(a['spend'],2):>12,.2f} {round(b['spend'],2):>12,.2f} {delta:>+10,.2f} {pct:>7.1f}%{flag}"
               f"  {round(a['purchase_value'],2):>12,.2f} {round(b['purchase_value'],2):>12,.2f}")
