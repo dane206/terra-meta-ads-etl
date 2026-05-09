@@ -64,6 +64,17 @@ python3 meta_ads_to_bigquery.py --mode backfill --start 2024-10-01
 python3 meta_ads_to_bigquery.py --mode catchup
 ```
 
+## ETL schedule (America/Los_Angeles)
+
+| Time | ETL |
+|---|---|
+| 6:00am | Google Ads |
+| 6:15am | Meta Ads |
+| 6:30am | Triple Whale |
+| 6:45am | Metorik |
+| 7:00am | Smartrr |
+| 7:15am | Shopify |
+
 ## Auth
 
 Long-lived access token stored in `config.ini`. Token expires every ~60 days and must be refreshed. BigQuery uses Application Default Credentials (ADC).
