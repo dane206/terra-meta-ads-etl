@@ -427,6 +427,103 @@ def fetch_insights(
         print(f" {len(window_rows):,}", end="", flush=True)
     return rows
 
+# ── Verify ───────────────────────────────────────────────────────────────────
+def verify_mode(start_date, end_date):
+    """Compare monthly spend totals between Meta API and BigQuery."""
+    FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
+    accounts = [a.strip() for a in ACCOUNT_IDS if a.strip()]
+
+    print(f"\n🔍 Verifying Meta API vs BigQuery: {start_date} → {end_date}")
+    print(f"   Accounts: {', '.join(account_label(a) for a in accounts)}\n")
+
+    # ── Fetch from Meta API (chunked to avoid 500s) ──────────────────────────
+    api_rows = {}  # (month, account_id) → {spend, purchase_value}
+    for account_id in accounts:
+        print(f"  Fetching from Meta API: {account_label(account_id)}...")
+        rows = fetch_insights(account_id, ["date_start", "account_id", "spend", "action_values"], "campaign", start_date, end_date)
+        for row in rows:
+            month = row.get("date_start", "")[:7]
+            norm_acct = account_id.replace("act_", "")
+            key = (month, norm_acct)
+            if key not in api_rows:
+                api_rows[key] = {"spend": 0.0, "purchase_value": 0.0}
+            api_rows[key]["spend"] += float(row.get("spend", 0))
+            api_rows[key]["purchase_value"] += get_action_value(row.get("action_values", []), "purchase")
+
+    # ── Fetch from BigQuery ──────────────────────────────────────────────────
+    bq_result = bq.query(f"""
+        SELECT
+          FORMAT_DATE('%Y-%m', date) AS month,
+          account_id,
+          ROUND(SUM(spend), 2) AS spend,
+          ROUND(SUM(purchase_value), 2) AS purchase_value
+        FROM `{BQ_PROJECT}.{BQ_DATASET}.meta_ads_campaigns_daily`
+        WHERE date BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY month, account_id
+        ORDER BY month, account_id
+    """).result()
+
+    bq_rows = {}
+    for row in bq_result:
+        bq_rows[(row.month, row.account_id)] = {
+            "spend": float(row.spend or 0),
+            "purchase_value": float(row.purchase_value or 0),
+        }
+
+    # ── Diff ─────────────────────────────────────────────────────────────────
+    all_keys = sorted(set(api_rows) | set(bq_rows))
+    has_issue = False
+
+    print(f"\n  {'Month':<8} {'Account':<12} {'API Spend':>12} {'BQ Spend':>12} {'Delta':>10} {'Delta%':>8}  {'API Rev':>12} {'BQ Rev':>12}")
+    print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*8}  {'-'*12} {'-'*12}")
+
+    monthly_api, monthly_bq = {}, {}
+    for key in all_keys:
+        month, acct = key
+        api = api_rows.get(key, {"spend": 0.0, "purchase_value": 0.0})
+        bq_  = bq_rows.get(key, {"spend": 0.0, "purchase_value": 0.0})
+
+        api_spend = round(api["spend"], 2)
+        bq_spend  = round(bq_["spend"], 2)
+        delta     = round(bq_spend - api_spend, 2)
+        if api_spend:
+            pct = round((delta / api_spend * 100), 1)
+        elif bq_spend:
+            pct = 100.0
+        else:
+            pct = 0.0
+        flag      = " ⚠️" if abs(pct) > 1 else ""
+        if flag:
+            has_issue = True
+
+        acct_short = ACCOUNT_NAMES.get(f"act_{acct}", ACCOUNT_NAMES.get(acct, acct))[-3:]
+        print(f"  {month:<8} {acct_short:<12} {api_spend:>12,.2f} {bq_spend:>12,.2f} {delta:>+10,.2f} {pct:>7.1f}%{flag}"
+              f"  {round(api['purchase_value'],2):>12,.2f} {round(bq_['purchase_value'],2):>12,.2f}")
+
+        for d, src in [(monthly_api, api), (monthly_bq, bq_)]:
+            if month not in d:
+                d[month] = {"spend": 0.0, "purchase_value": 0.0}
+            d[month]["spend"]          += src["spend"]
+            d[month]["purchase_value"] += src["purchase_value"]
+
+    print(f"\n  {'Month':<8} {'API Spend':>12} {'BQ Spend':>12} {'Delta':>10} {'Delta%':>8}  {'API Rev':>12} {'BQ Rev':>12}  (all accounts)")
+    print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*10} {'-'*8}  {'-'*12} {'-'*12}")
+    for month in sorted(set(monthly_api) | set(monthly_bq)):
+        a = monthly_api.get(month, {"spend": 0.0, "purchase_value": 0.0})
+        b = monthly_bq.get(month, {"spend": 0.0, "purchase_value": 0.0})
+        delta = round(b["spend"] - a["spend"], 2)
+        if a["spend"]:
+            pct = round((delta / a["spend"] * 100), 1)
+        elif b["spend"]:
+            pct = 100.0
+        else:
+            pct = 0.0
+        flag  = " ⚠️" if abs(pct) > 1 else ""
+        print(f"  {month:<8} {round(a['spend'],2):>12,.2f} {round(b['spend'],2):>12,.2f} {delta:>+10,.2f} {pct:>7.1f}%{flag}"
+              f"  {round(a['purchase_value'],2):>12,.2f} {round(b['purchase_value'],2):>12,.2f}")
+
+    print(f"\n{'⚠️  Discrepancies found (>1% delta).' if has_issue else '✅ All months within 1% tolerance.'}")
+
 # ── Main runner ───────────────────────────────────────────────────────────────
 def run(start_date, end_date, write_mode, loaded_at):
     all_campaigns, all_adsets, all_ads = [], [], []
@@ -526,7 +623,7 @@ def main():
     FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["backfill", "catchup", "incremental"], default="incremental")
+    parser.add_argument("--mode", choices=["backfill", "catchup", "incremental", "verify"], default="incremental")
     parser.add_argument("--start", default=EARLIEST_DATE, help="Backfill start date (YYYY-MM-DD)")
     parser.add_argument("--end", help="Optional end date (YYYY-MM-DD); defaults to yesterday")
     args = parser.parse_args()
@@ -534,6 +631,10 @@ def main():
     yesterday = date.today() - timedelta(days=1)
     end_date = datetime.strptime(args.end, "%Y-%m-%d").date() if args.end else yesterday
     end_date = min(end_date, yesterday)
+
+    if args.mode == "verify":
+        verify_mode(args.start, str(end_date))
+        return
 
     if args.mode == "incremental":
         max_date   = get_max_date("meta_ads_campaigns_daily")
@@ -561,6 +662,21 @@ def main():
     else:
         # Backfill in monthly chunks to avoid Meta API 500s
         chunk_start = datetime.strptime(args.start, "%Y-%m-%d").date()
+
+        # Resume from last loaded month if already partially backfilled
+        max_date = get_max_date("meta_ads_campaigns_daily")
+        if max_date:
+            bq_max = datetime.strptime(max_date, "%Y-%m-%d").date()
+            # Advance to start of the next month after max loaded date
+            if bq_max >= chunk_start:
+                if bq_max.month == 12:
+                    resume_from = date(bq_max.year + 1, 1, 1)
+                else:
+                    resume_from = date(bq_max.year, bq_max.month + 1, 1)
+                if resume_from > chunk_start:
+                    print(f"   Resuming from {resume_from} (BQ already has data through {bq_max})")
+                    chunk_start = resume_from
+
         print(f"\U0001f680 Meta Ads backfill: {chunk_start} \u2192 {end_date} (monthly chunks)")
         print(f"   Accounts: {', '.join(account_label(a) for a in ACCOUNT_IDS)}")
         print(f"   Project:  {BQ_PROJECT}.{BQ_DATASET}")
