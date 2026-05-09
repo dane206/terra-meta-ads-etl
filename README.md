@@ -48,20 +48,29 @@ dataset = sources
 
 To generate a long-lived access token: Facebook Developer Console → Your App → Tools → Graph API Explorer → generate token with `ads_read` permission, then exchange for long-lived token.
 
+## Modes
+
+| Mode | What it does |
+|---|---|
+| `incremental` | Fetches the last 7 days and appends to BQ. Runs daily via scheduler. |
+| `backfill` | Fetches a full date range month-by-month and replaces BQ data for each month. Resumes automatically from BQ max date on restart. |
+| `catchup` | Fetches the single next missing calendar month after the current BQ max date. |
+| `verify` | Compares monthly spend and revenue totals between Meta API and BQ. Flags any month with >1% discrepancy. |
+
 ## Usage
 
 ```bash
-# Incremental — last 7 days, APPEND
+# Daily incremental (last 7 days)
 python3 meta_ads_to_bigquery.py --mode incremental
 
-# Backfill — 2024-04-01 → yesterday, TRUNCATE
-python3 meta_ads_to_bigquery.py --mode backfill
+# Backfill a specific range
+python3 meta_ads_to_bigquery.py --mode backfill --start 2024-10-01 --end 2024-10-31
 
-# Backfill from specific date
-python3 meta_ads_to_bigquery.py --mode backfill --start 2024-10-01
-
-# Catch up one missing calendar month after current MAX(date)
+# Catch up one missing month
 python3 meta_ads_to_bigquery.py --mode catchup
+
+# Verify data integrity against Meta API
+python3 meta_ads_to_bigquery.py --mode verify --start 2024-04-01 --end 2026-05-09
 ```
 
 ## ETL schedule (America/Los_Angeles)
